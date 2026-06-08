@@ -1,22 +1,15 @@
-from __future__ import annotations
-
 import argparse
 import importlib.util
-import json
 import mimetypes
-import os
 import re
 import socket
 import sys
 import threading
 import time
 import webbrowser
-from collections import defaultdict
-from collections.abc import Awaitable, Callable
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlencode
-
-import uvicorn
+from urllib.parse import urlencode, urlsplit
 
 
 STARTUP_DELAY_SECONDS = 0.8
@@ -24,12 +17,9 @@ RUNNER_DIR = Path(__file__).resolve().parent
 ROOT = RUNNER_DIR.parent.parent
 PROJECTS_DIR = ROOT / "projects"
 PROJECT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
-AsgiSend = Callable[[dict], Awaitable[None]]
-AsgiReceive = Callable[[], Awaitable[dict]]
-AsgiApp = Callable[[dict, AsgiReceive, AsgiSend], Awaitable[None]]
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         prog="douwe",
         description="Run one douwe.com project locally.",
@@ -59,7 +49,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def find_open_port(host: str, preferred_port: int) -> int:
+def find_open_port(host, preferred_port):
     for port in range(preferred_port, preferred_port + 100):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -73,7 +63,7 @@ def find_open_port(host: str, preferred_port: int) -> int:
     )
 
 
-def configure_django() -> None:
+def configure_django():
     root = str(ROOT)
     if root not in sys.path:
         sys.path.insert(0, root)
@@ -108,7 +98,7 @@ def configure_django() -> None:
     )
 
 
-def load_project(project_id: str):
+def load_project(project_id):
     if not PROJECT_ID_RE.match(project_id):
         return None
 
@@ -152,48 +142,18 @@ def load_project(project_id: str):
     return Project.get_project(project_id)
 
 
-def project_url(project_id: str, embed: bool = False) -> str:
+def project_url(project_id, embed=False):
     path = f"/projects/{project_id}"
     if not embed:
         return path
     return f"{path}?{urlencode({'embed': '1'})}"
 
 
-async def send_response(
-    send: AsgiSend,
-    status: int,
-    body: bytes = b"",
-    headers: list[tuple[bytes, bytes]] | None = None,
-) -> None:
-    await send(
-        {
-            "type": "http.response.start",
-            "status": status,
-            "headers": headers or [],
-        }
-    )
-    await send({"type": "http.response.body", "body": body})
+def not_found_response():
+    return 404, b"Not found", {"content-type": "text/plain; charset=utf-8"}
 
 
-async def send_redirect(send: AsgiSend, location: str) -> None:
-    await send_response(send, 302, headers=[(b"location", location.encode("utf-8"))])
-
-
-def django_response_to_asgi(response) -> tuple[int, bytes, list[tuple[bytes, bytes]]]:
-    headers = [
-        (key.lower().encode("utf-8"), value.encode("utf-8"))
-        for key, value in response.headers.items()
-    ]
-    return response.status_code, bytes(response.content), headers
-
-
-def not_found_response() -> tuple[int, bytes, list[tuple[bytes, bytes]]]:
-    return 404, b"Not found", [(b"content-type", b"text/plain; charset=utf-8")]
-
-
-def static_response(
-    path: str, project_id: str
-) -> tuple[int, bytes, list[tuple[bytes, bytes]]]:
+def static_response(path, project_id):
     prefixes = {
         f"/static/projects/{project_id}/": [
             PROJECTS_DIR / project_id / "static",
@@ -217,157 +177,99 @@ def static_response(
                 content_type = (
                     mimetypes.guess_type(candidate)[0] or "application/octet-stream"
                 )
-                return (
-                    200,
-                    candidate.read_bytes(),
-                    [(b"content-type", content_type.encode("utf-8"))],
-                )
+                return 200, candidate.read_bytes(), {"content-type": content_type}
     return not_found_response()
 
 
-def make_request(scope: dict, body: bytes = b""):
+def make_request(handler, body=b""):
     from django.test import RequestFactory
 
-    query_string = scope.get("query_string", b"").decode("latin1")
-    path = scope.get("path") or "/"
-    full_path = path if not query_string else f"{path}?{query_string}"
-    headers = {
-        key.decode("latin1").replace("_", "-"): value.decode("latin1")
-        for key, value in scope.get("headers", [])
-    }
+    headers = {key.lower(): value for key, value in handler.headers.items()}
     request = RequestFactory().generic(
-        scope.get("method", "GET"),
-        full_path,
+        handler.command,
+        handler.path,
         data=body,
         content_type=headers.get("content-type", "application/octet-stream"),
     )
-    request.META["SERVER_NAME"] = "127.0.0.1"
-    request.META["SERVER_PORT"] = "8765"
+    request.META["SERVER_NAME"] = handler.server.server_name
+    request.META["SERVER_PORT"] = str(handler.server.server_port)
     return request
 
 
-async def read_body(receive: AsgiReceive) -> bytes:
-    chunks = []
-    while True:
-        message = await receive()
-        if message["type"] != "http.request":
-            break
-        chunks.append(message.get("body", b""))
-        if not message.get("more_body"):
-            break
-    return b"".join(chunks)
+def django_response_tuple(response):
+    headers = {key.lower(): value for key, value in response.headers.items()}
+    return response.status_code, bytes(response.content), headers
 
 
-def project_http_response(project, scope: dict, body: bytes):
+def project_response(project, handler, path, body):
     from django.http import HttpResponseRedirect
 
-    path = scope.get("path") or "/"
-    request = make_request(scope, body)
+    request = make_request(handler, body)
     prefix = f"/projects/{project.id}"
-    handler = None
+    handler_name = None
     if path.startswith(prefix + "/"):
-        handler = path.removeprefix(prefix + "/")
+        handler_name = path.removeprefix(prefix + "/")
 
-    if handler:
-        response = project.handle_request(handler, request)
+    if handler_name:
+        response = project.handle_request(handler_name, request)
         if response:
-            return django_response_to_asgi(response)
-        return django_response_to_asgi(HttpResponseRedirect("/projects/unknown"))
-    return django_response_to_asgi(project.render(request))
+            return django_response_tuple(response)
+        return django_response_tuple(HttpResponseRedirect("/projects/unknown"))
+    return django_response_tuple(project.render(request))
 
 
-def websocket_app(project) -> AsgiApp:
-    groups: dict[str, set[AsgiSend]] = defaultdict(set)
-
-    async def send_json(send: AsgiSend, payload: dict) -> None:
-        await send({"type": "websocket.send", "text": json.dumps(payload)})
-
-    async def application(scope: dict, receive: AsgiReceive, send: AsgiSend) -> None:
-        path = scope.get("path", "")
-        if path != f"/ws/projects/{project.id}":
-            await send({"type": "websocket.close", "code": 1008})
-            return
-
-        await send({"type": "websocket.accept"})
-        group_name = project.id
-        groups[group_name].add(send)
-        try:
-            while True:
-                message = await receive()
-                if message["type"] == "websocket.disconnect":
-                    return
-                if message["type"] != "websocket.receive":
-                    continue
-                text = message.get("text")
-                if text is None:
-                    continue
-                data = json.loads(text)
-                room = data.get("room")
-                if room:
-                    groups[group_name].discard(send)
-                    group_name = f"{project.id}-{room}"
-                    groups[group_name].add(send)
-                response = project.receive(data)
-                if response is None:
-                    continue
-                do_broadcast = response.pop("broadcast", False)
-                if do_broadcast:
-                    for group_send in list(groups[group_name]):
-                        await send_json(group_send, response)
-                else:
-                    await send_json(send, response)
-        finally:
-            groups[group_name].discard(send)
-
-    return application
-
-
-def runner_app(project_id: str, embed: bool) -> AsgiApp:
-    project = load_project(project_id)
-    if project is None:
-        raise RuntimeError(f"Unknown project: {project_id}")
-
+def make_handler(project, embed):
     root_target = project_url(project.id, embed)
-    ws_app = websocket_app(project)
 
-    async def application(scope: dict, receive: AsgiReceive, send: AsgiSend) -> None:
-        scope_type = scope["type"]
-        path = scope.get("path") or "/"
+    class DouweProjectHandler(BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.handle_request(send_body=False)
 
-        if scope_type == "lifespan":
-            while True:
-                message = await receive()
-                if message["type"] == "lifespan.startup":
-                    await send({"type": "lifespan.startup.complete"})
-                elif message["type"] == "lifespan.shutdown":
-                    await send({"type": "lifespan.shutdown.complete"})
-                    return
-        if scope_type == "websocket":
-            await ws_app(scope, receive, send)
-            return
-        if scope_type != "http":
-            return
-        if path in {"", "/"}:
-            await send_redirect(send, root_target)
-            return
-        if path.startswith("/static/"):
-            status, body, headers = static_response(path, project.id)
-            await send_response(send, status, body, headers)
-            return
-        if path == f"/projects/{project.id}" or path.startswith(
-            f"/projects/{project.id}/"
-        ):
-            body = await read_body(receive)
-            status, content, headers = project_http_response(project, scope, body)
-            await send_response(send, status, content, headers)
-            return
-        await send_response(send, *not_found_response())
+        def do_GET(self):
+            self.handle_request()
 
-    return application
+        def do_POST(self):
+            self.handle_request()
+
+        def handle_request(self, send_body=True):
+            parsed = urlsplit(self.path)
+            path = parsed.path or "/"
+            body = self.read_body()
+
+            if path == "/":
+                self.send_response(302)
+                self.send_header("location", root_target)
+                self.end_headers()
+                return
+
+            if path.startswith("/static/"):
+                status, content, headers = static_response(path, project.id)
+            elif path == f"/projects/{project.id}" or path.startswith(
+                f"/projects/{project.id}/"
+            ):
+                status, content, headers = project_response(project, self, path, body)
+            else:
+                status, content, headers = not_found_response()
+
+            self.send_response(status)
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.send_header("content-length", str(len(content)))
+            self.end_headers()
+            if send_body:
+                self.wfile.write(content)
+
+        def read_body(self):
+            length = int(self.headers.get("content-length", "0") or 0)
+            if not length:
+                return b""
+            return self.rfile.read(length)
+
+    return DouweProjectHandler
 
 
-def open_browser_later(url: str) -> None:
-    def opener() -> None:
+def open_browser_later(url):
+    def opener():
         time.sleep(STARTUP_DELAY_SECONDS)
         webbrowser.open(url)
 
@@ -375,7 +277,7 @@ def open_browser_later(url: str) -> None:
     thread.start()
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv=None):
     args = parse_args(argv)
     project = load_project(args.project)
     if project is None:
@@ -391,7 +293,14 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_browser:
         open_browser_later(url)
 
-    uvicorn.run(runner_app(project.id, args.embed), host=args.host, port=port)
+    handler = make_handler(project, args.embed)
+    server = ThreadingHTTPServer((args.host, port), handler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        server.server_close()
     return 0
 
 
