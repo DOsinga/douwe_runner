@@ -31,6 +31,7 @@ INFO_RE = re.compile(
     re.DOTALL,
 )
 LOAD_STATIC_RE = re.compile(r"{%\s*load\s+static\s*%}\s*")
+CSRF_TOKEN_RE = re.compile(r"{%\s*csrf_token\s*%}\s*")
 DJANGO_STATIC_RE = re.compile(r"{%\s*static\s+(['\"])(.*?)\1\s*%}")
 PROJECT_STATIC = "./static/"
 SHARED_STATIC = "./_site_static/"
@@ -87,6 +88,7 @@ class RunnerRequest:
             for key, values in parse_qs(parsed.query).items()
         }
         self.POST = {}
+        self.FILES = {}
         content_type = handler.request.headers.get("content-type", "")
         if self.body and content_type.startswith(
             "application/x-www-form-urlencoded"
@@ -174,6 +176,7 @@ def strip_info_block(html):
 
 def preprocess_template(template_source):
     template_source = LOAD_STATIC_RE.sub("", template_source)
+    template_source = CSRF_TOKEN_RE.sub("", template_source)
     return DJANGO_STATIC_RE.sub(r"{{ site_static('\2') }}", template_source)
 
 
