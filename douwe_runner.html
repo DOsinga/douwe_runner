@@ -1,0 +1,22 @@
+<script type="text/markdown" id="info">
+name: Douwe Runner
+description: >
+  Standalone local runner for douwe.com project directories.
+type: ai
+github: douwe_runner
+files:
+  - [douwe.py, "Local project runner"]
+</script>
+
+<p>
+  Douwe Runner starts a single project from this repository without booting the
+  whole Django site. From the repository root:
+</p>
+
+<pre><code>python projects/douwe_runner/douwe.py cambrium</code></pre>
+
+<p>
+  It loads only the requested project, renders its Django template with a small
+  compatibility layer, serves project static files, and opens the result in a
+  browser.
+</p>
