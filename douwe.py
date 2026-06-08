@@ -28,6 +28,8 @@ INFO_RE = re.compile(
 )
 LOAD_STATIC_RE = re.compile(r"{%\s*load\s+static\s*%}\s*")
 DJANGO_STATIC_RE = re.compile(r"{%\s*static\s+(['\"])(.*?)\1\s*%}")
+PROJECT_STATIC = "./static/"
+SHARED_STATIC = "./_site_static/"
 
 
 class RunnerProject:
@@ -64,8 +66,8 @@ class RunnerProject:
         for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"):
             image = PROJECTS_DIR / self.id / f"{self.id}{ext}"
             if image.is_file():
-                return f"/static/projects/{self.id}/{self.id}{ext}"
-        return "/static/projects/visited/visited.jpg"
+                return f"{PROJECT_STATIC}{self.id}{ext}"
+        return f"{SHARED_STATIC}projects/visited/visited.jpg"
 
 
 class RunnerRequest:
@@ -155,7 +157,7 @@ def strip_info_block(html):
 
 def preprocess_template(template_source):
     template_source = LOAD_STATIC_RE.sub("", template_source)
-    return DJANGO_STATIC_RE.sub(r"{{ static_file('\2') }}", template_source)
+    return DJANGO_STATIC_RE.sub(r"{{ site_static('\2') }}", template_source)
 
 
 def load_project(project_id):
@@ -238,22 +240,21 @@ def find_project_class(module):
 
 
 def project_url(project_id, embed=False):
-    path = f"/projects/{project_id}"
+    path = "/"
     if not embed:
         return path
     return f"{path}?{urlencode({'embed': '1'})}"
 
 
 def jinja_env(project):
-    static_prefix = f"/static/projects/{project.id}/"
     env = jinja2.Environment(autoescape=False)
-    env.globals["static_file"] = lambda path: f"/static/{path}"
-    env.globals["project_static"] = lambda path: f"{static_prefix}{path}"
+    env.globals["site_static"] = lambda path: f"{SHARED_STATIC}{path}"
+    env.globals["project_static"] = lambda path: f"{PROJECT_STATIC}{path}"
     return env
 
 
 def render_project_body(project, request):
-    context = {"static": f"/static/projects/{project.id}/", "fs": request.GET.get("fs")}
+    context = {"static": PROJECT_STATIC, "fs": request.GET.get("fs")}
     for key in project.pass_on_request:
         if key in request.GET:
             context[key] = request.GET[key]
@@ -272,7 +273,7 @@ def render_project_page(project, request, embed=False):
         items = []
         for entry in project.files:
             filename, description = entry[0], entry[1]
-            url = f"/static/projects/{project.id}/{filename}"
+            url = f"{PROJECT_STATIC}{filename}"
             items.append(
                 f'<dt><a href="{tornado.escape.xhtml_escape(url)}">'
                 f"{tornado.escape.xhtml_escape(filename)}</a></dt>"
@@ -295,7 +296,6 @@ def render_project_page(project, request, embed=False):
   <meta name="description" content="{tornado.escape.xhtml_escape(project.shortdescription)}">
   <meta property="og:title" content="{tornado.escape.xhtml_escape(project.name)}">
   <meta property="og:image" content="{tornado.escape.xhtml_escape(project.thumbnail())}">
-  <script src="/static/jquery-3.1.1.min.js"></script>
   <style>
     body {{ font-family: Georgia, serif; margin: 2rem auto; max-width: 900px; line-height: 1.5; padding: 0 1rem; }}
     h1 {{ font-family: system-ui, sans-serif; }}
@@ -326,11 +326,11 @@ def not_found_response():
 
 def static_response(path, project_id):
     prefixes = {
-        f"/static/projects/{project_id}/": [
+        "/static/": [
             PROJECTS_DIR / project_id / "static",
             PROJECTS_DIR / project_id,
         ],
-        "/static/": [ROOT / "static"],
+        "/_site_static/": [ROOT / "static"],
     }
     for prefix, roots in prefixes.items():
         if not path.startswith(prefix):
@@ -378,7 +378,25 @@ class RootHandler(tornado.web.RequestHandler):
         self.embed = embed
 
     def get(self):
-        self.redirect(project_url(self.project.id, self.embed))
+        request = RunnerRequest(self)
+        html = render_project_page(
+            self.project, request, self.embed or request.GET.get("embed")
+        )
+        self.set_header("content-type", "text/html; charset=utf-8")
+        self.write(html)
+
+
+class ProjectRedirectHandler(tornado.web.RequestHandler):
+    def initialize(self, project, embed):
+        self.project = project
+        self.embed = embed
+
+    def get(self, handler_name=None):
+        suffix = f"?{self.request.query}" if self.request.query else ""
+        if handler_name:
+            self.redirect(f"/{handler_name}{suffix}")
+        else:
+            self.redirect(f"{project_url(self.project.id, self.embed)}{suffix}")
 
 
 class StaticHandler(tornado.web.RequestHandler):
@@ -392,7 +410,8 @@ class StaticHandler(tornado.web.RequestHandler):
         self.serve(path, include_body=False)
 
     def serve(self, path, include_body=True):
-        status, content, headers = static_response(f"/static/{path}", self.project.id)
+        prefix = "/_site_static/" if self.request.path.startswith("/_site_static/") else "/static/"
+        status, content, headers = static_response(f"{prefix}{path}", self.project.id)
         self.set_status(status)
         for key, value in headers.items():
             self.set_header(key, value)
@@ -441,15 +460,17 @@ def make_app(project, embed):
             (r"/", RootHandler, {"project": project, "embed": embed}),
             (
                 rf"/projects/{re.escape(project.id)}",
-                ProjectHandler,
+                ProjectRedirectHandler,
                 {"project": project, "embed": embed},
             ),
             (
                 rf"/projects/{re.escape(project.id)}/(.*)",
-                ProjectHandler,
+                ProjectRedirectHandler,
                 {"project": project, "embed": embed},
             ),
             (r"/static/(.*)", StaticHandler, {"project": project}),
+            (r"/_site_static/(.*)", StaticHandler, {"project": project}),
+            (r"/(.*)", ProjectHandler, {"project": project, "embed": embed}),
         ],
         debug=True,
     )

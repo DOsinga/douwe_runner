@@ -19,9 +19,8 @@ dependency-heavy projects from breaking otherwise simple projects.
 
 This version uses Tornado for serving and Jinja2 for project template rendering.
 It does not call Django's renderer or configure Django settings. `{% load static
-%}` is stripped from project templates, `{{ static }}` points at the project
-static directory, and `{% static "..." %}` is rewritten to a shared `/static/...`
-URL.
+%}` is stripped from project templates, `{{ static }}` points at `./static/`,
+and `{% static "..." %}` is rewritten to a shared `./_site_static/...` URL.
 
 Projects that require WebSockets still need the full Django/Channels site for
 now, but Tornado gives the runner a natural place to add that later.
