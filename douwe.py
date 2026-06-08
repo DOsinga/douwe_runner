@@ -7,9 +7,14 @@ import sys
 import threading
 import time
 import webbrowser
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
+
+import jinja2
+import tornado.ioloop
+import tornado.escape
+import tornado.web
+import yaml
 
 
 STARTUP_DELAY_SECONDS = 0.8
@@ -17,6 +22,72 @@ RUNNER_DIR = Path(__file__).resolve().parent
 ROOT = RUNNER_DIR.parent.parent
 PROJECTS_DIR = ROOT / "projects"
 PROJECT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+INFO_RE = re.compile(
+    r'<script\s+type="text/markdown"\s+id="info"\s*>(.*?)</script>',
+    re.DOTALL,
+)
+LOAD_STATIC_RE = re.compile(r"{%\s*load\s+static\s*%}\s*")
+DJANGO_STATIC_RE = re.compile(r"{%\s*static\s+(['\"])(.*?)\1\s*%}")
+
+
+class RunnerProject:
+    def __init__(self, project_id, info, html_path):
+        self.id = project_id
+        self.name = info.get("name", project_id)
+        self.description = info.get("description", "")
+        self.shortdescription = info.get("shortdescription") or self.description
+        self.type = info.get("type")
+        self.github = github_name(info.get("github"))
+        self.files = info.get("files") or []
+        self.pass_on_request = info.get("pass_on_request") or []
+        self.nochrome = info.get("nochrome", False)
+        self.dontrepeatintro = info.get("dontrepeatintro", False)
+        self.html_path = html_path
+        self.template_source = preprocess_template(strip_info_block(html_path.read_text()))
+        self.impl = None
+
+    def fill_dict(self, request, context):
+        if self.impl:
+            self.impl.fill_dict(request, context)
+
+    def handle_request(self, handler_name, request):
+        if self.impl:
+            return self.impl.handle_request(handler_name, request)
+        return None
+
+    def receive(self, payload):
+        if self.impl:
+            return self.impl.receive(payload)
+        return None
+
+    def thumbnail(self):
+        for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"):
+            image = PROJECTS_DIR / self.id / f"{self.id}{ext}"
+            if image.is_file():
+                return f"/static/projects/{self.id}/{self.id}{ext}"
+        return "/static/projects/visited/visited.jpg"
+
+
+class RunnerRequest:
+    def __init__(self, handler):
+        parsed = urlsplit(handler.request.uri)
+        self.method = handler.request.method
+        self.path = parsed.path
+        self.body = handler.request.body or b""
+        self.GET = {
+            key: values[-1] if values else ""
+            for key, values in parse_qs(parsed.query).items()
+        }
+        self.POST = {}
+        content_type = handler.request.headers.get("content-type", "")
+        if self.body and content_type.startswith(
+            "application/x-www-form-urlencoded"
+        ):
+            self.POST = {
+                key: values[-1] if values else ""
+                for key, values in parse_qs(self.body.decode("utf-8")).items()
+            }
+        self.headers = handler.request.headers
 
 
 def parse_args(argv=None):
@@ -63,83 +134,107 @@ def find_open_port(host, preferred_port):
     )
 
 
-def configure_django():
-    root = str(ROOT)
-    if root not in sys.path:
-        sys.path.insert(0, root)
+def github_name(github):
+    if not github:
+        return None
+    if github.startswith("/"):
+        return github[1:]
+    return f"DOsinga/{github}"
 
-    from django.conf import settings
 
-    if settings.configured:
-        return
+def parse_info_block(html):
+    match = INFO_RE.search(html)
+    if not match:
+        return None
+    return yaml.safe_load(match.group(1)) or {}
 
-    settings.configure(
-        SECRET_KEY="douwe-local-runner",
-        DEBUG=True,
-        ALLOWED_HOSTS=["127.0.0.1", "localhost"],
-        ROOT_URLCONF=__name__,
-        DEFAULT_CHARSET="utf-8",
-        DEFAULT_AUTO_FIELD="django.db.models.BigAutoField",
-        STATIC_URL="/static/",
-        INSTALLED_APPS=["projects"],
-        TEMPLATES=[
-            {
-                "BACKEND": "django.template.backends.django.DjangoTemplates",
-                "DIRS": [
-                    str(ROOT / "templates"),
-                    str(ROOT / "projects" / "templates"),
-                ],
-                "APP_DIRS": False,
-                "OPTIONS": {"context_processors": []},
-            }
-        ],
-        DATABASES={"default": {"ENGINE": "django.db.backends.dummy"}},
-        USE_TZ=True,
-    )
+
+def strip_info_block(html):
+    return INFO_RE.sub("", html, count=1).strip()
+
+
+def preprocess_template(template_source):
+    template_source = LOAD_STATIC_RE.sub("", template_source)
+    return DJANGO_STATIC_RE.sub(r"{{ static_file('\2') }}", template_source)
 
 
 def load_project(project_id):
     if not PROJECT_ID_RE.match(project_id):
         return None
 
-    configure_django()
-
-    import django
-
-    django.setup()
-
-    from projects.autodiscover import find_project_class, parse_info_block
-    from projects.common import Project
-
     project_dir = PROJECTS_DIR / project_id
-    html_file = project_dir / f"{project_id}.html"
-    if not html_file.is_file():
+    html_path = project_dir / f"{project_id}.html"
+    if not html_path.is_file():
         return None
 
-    with html_file.open() as f:
-        info, _ = parse_info_block(f.read())
+    info = parse_info_block(html_path.read_text())
     if info is None:
         return None
 
-    project_class = Project
-    py_file = project_dir / f"{project_id}.py"
-    if py_file.is_file():
-        module_name = f"projects.{project_id}.{project_id}"
-        spec = importlib.util.spec_from_file_location(module_name, py_file)
-        if spec and spec.loader:
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = module
-            spec.loader.exec_module(module)
-            found = find_project_class(module)
-            if found:
-                project_class = found
+    project = RunnerProject(project_id, info, html_path)
+    project.impl = load_project_impl(project)
+    return project
 
-    name = info.pop("name", project_id)
-    description = info.pop("description", "")
-    info["_directory_based"] = True
-    info["_html_path"] = str(html_file)
-    project_class(project_id, name, description, **info)
-    return Project.get_project(project_id)
+
+def load_project_impl(project):
+    py_file = PROJECTS_DIR / project.id / f"{project.id}.py"
+    if not py_file.is_file():
+        return None
+
+    root = str(ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+    module_name = f"douwe_runner_loaded.{project.id}"
+    spec = importlib.util.spec_from_file_location(module_name, py_file)
+    if not spec or not spec.loader:
+        return None
+
+    try:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        print(f"Warning: could not load {py_file}: {exc}", file=sys.stderr)
+        return None
+
+    impl_class = find_project_class(module)
+    if not impl_class:
+        return None
+
+    try:
+        return impl_class(
+            project.id,
+            project.name,
+            project.description,
+            shortdescription=project.shortdescription,
+            type=project.type,
+            files=project.files,
+            github=project.github,
+            pass_on_request=project.pass_on_request,
+            nochrome=project.nochrome,
+            dontrepeatintro=project.dontrepeatintro,
+        )
+    except Exception as exc:
+        print(f"Warning: could not initialize {py_file}: {exc}", file=sys.stderr)
+        return None
+
+
+def find_project_class(module):
+    try:
+        from projects.common import Project
+    except Exception:
+        Project = None
+
+    for name in dir(module):
+        obj = getattr(module, name)
+        if not isinstance(obj, type):
+            continue
+        if Project and issubclass(obj, Project) and obj is not Project:
+            return obj
+        if name != "Project" and hasattr(obj, "fill_dict"):
+            return obj
+    return None
 
 
 def project_url(project_id, embed=False):
@@ -149,8 +244,84 @@ def project_url(project_id, embed=False):
     return f"{path}?{urlencode({'embed': '1'})}"
 
 
+def jinja_env(project):
+    static_prefix = f"/static/projects/{project.id}/"
+    env = jinja2.Environment(autoescape=False)
+    env.globals["static_file"] = lambda path: f"/static/{path}"
+    env.globals["project_static"] = lambda path: f"{static_prefix}{path}"
+    return env
+
+
+def render_project_body(project, request):
+    context = {"static": f"/static/projects/{project.id}/", "fs": request.GET.get("fs")}
+    for key in project.pass_on_request:
+        if key in request.GET:
+            context[key] = request.GET[key]
+    project.fill_dict(request, context)
+    template = jinja_env(project).from_string(project.template_source)
+    return template.render(**context)
+
+
+def render_project_page(project, request, embed=False):
+    body = render_project_body(project, request)
+    if project.nochrome or embed:
+        return body
+
+    downloads = ""
+    if project.files and not request.GET.get("fs"):
+        items = []
+        for entry in project.files:
+            filename, description = entry[0], entry[1]
+            url = f"/static/projects/{project.id}/{filename}"
+            items.append(
+                f'<dt><a href="{tornado.escape.xhtml_escape(url)}">'
+                f"{tornado.escape.xhtml_escape(filename)}</a></dt>"
+                f"<dd>{tornado.escape.xhtml_escape(description)}</dd>"
+            )
+        downloads = f"""
+        <div class="downloads">
+          <h3>Downloads</h3>
+          <dl>{''.join(items)}</dl>
+        </div>
+        """
+
+    intro = "" if project.dontrepeatintro else project.description
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{tornado.escape.xhtml_escape(project.name)}</title>
+  <meta name="description" content="{tornado.escape.xhtml_escape(project.shortdescription)}">
+  <meta property="og:title" content="{tornado.escape.xhtml_escape(project.name)}">
+  <meta property="og:image" content="{tornado.escape.xhtml_escape(project.thumbnail())}">
+  <script src="/static/jquery-3.1.1.min.js"></script>
+  <style>
+    body {{ font-family: Georgia, serif; margin: 2rem auto; max-width: 900px; line-height: 1.5; padding: 0 1rem; }}
+    h1 {{ font-family: system-ui, sans-serif; }}
+    canvas {{ max-width: 100%; }}
+    .downloads {{ margin-top: 2em; padding-top: 1.5em; border-top: 1px solid #ddd; }}
+    .downloads dl {{ display: grid; grid-template-columns: minmax(140px, 220px) 1fr; gap: .5em 1.5em; }}
+    .downloads dt, .downloads dd {{ margin: 0; }}
+  </style>
+</head>
+<body>
+  <h1>{tornado.escape.xhtml_escape(project.name)}</h1>
+  <div class="intro">{intro}</div>
+  <article>{body}</article>
+  {downloads}
+</body>
+</html>"""
+
+
+def response_tuple(status, body, content_type="text/html; charset=utf-8", headers=None):
+    headers = dict(headers or {})
+    headers.setdefault("content-type", content_type)
+    return status, body.encode("utf-8"), headers
+
+
 def not_found_response():
-    return 404, b"Not found", {"content-type": "text/plain; charset=utf-8"}
+    return response_tuple(404, "Not found", "text/plain; charset=utf-8")
 
 
 def static_response(path, project_id):
@@ -181,91 +352,107 @@ def static_response(path, project_id):
     return not_found_response()
 
 
-def make_request(handler, body=b""):
-    from django.test import RequestFactory
+def handler_response(project, handler_name, request):
+    response = project.handle_request(handler_name, request)
+    if response is None:
+        return response_tuple(
+            501,
+            f"{project.id}/{handler_name} is not handled by the lightweight runner.",
+            "text/plain; charset=utf-8",
+        )
+    if isinstance(response, str):
+        return response_tuple(200, response)
+    if isinstance(response, bytes):
+        return 200, response, {"content-type": "application/octet-stream"}
+    if hasattr(response, "content") and hasattr(response, "status_code"):
+        headers = {
+            key.lower(): value for key, value in getattr(response, "headers", {}).items()
+        }
+        return response.status_code, bytes(response.content), headers
+    return response_tuple(200, str(response), "text/plain; charset=utf-8")
 
-    headers = {key.lower(): value for key, value in handler.headers.items()}
-    request = RequestFactory().generic(
-        handler.command,
-        handler.path,
-        data=body,
-        content_type=headers.get("content-type", "application/octet-stream"),
+
+class RootHandler(tornado.web.RequestHandler):
+    def initialize(self, project, embed):
+        self.project = project
+        self.embed = embed
+
+    def get(self):
+        self.redirect(project_url(self.project.id, self.embed))
+
+
+class StaticHandler(tornado.web.RequestHandler):
+    def initialize(self, project):
+        self.project = project
+
+    def get(self, path):
+        self.serve(path)
+
+    def head(self, path):
+        self.serve(path, include_body=False)
+
+    def serve(self, path, include_body=True):
+        status, content, headers = static_response(f"/static/{path}", self.project.id)
+        self.set_status(status)
+        for key, value in headers.items():
+            self.set_header(key, value)
+        self.set_header("content-length", str(len(content)))
+        if include_body:
+            self.write(content)
+
+
+class ProjectHandler(tornado.web.RequestHandler):
+    def initialize(self, project, embed):
+        self.project = project
+        self.embed = embed
+
+    def get(self, handler_name=None):
+        self.respond(handler_name)
+
+    def post(self, handler_name=None):
+        self.respond(handler_name)
+
+    def head(self, handler_name=None):
+        self.respond(handler_name, include_body=False)
+
+    def respond(self, handler_name=None, include_body=True):
+        request = RunnerRequest(self)
+        if handler_name:
+            status, content, headers = handler_response(
+                self.project, handler_name, request
+            )
+        else:
+            html = render_project_page(
+                self.project, request, self.embed or request.GET.get("embed")
+            )
+            status, content, headers = response_tuple(200, html)
+
+        self.set_status(status)
+        for key, value in headers.items():
+            self.set_header(key, value)
+        self.set_header("content-length", str(len(content)))
+        if include_body:
+            self.write(content)
+
+
+def make_app(project, embed):
+    return tornado.web.Application(
+        [
+            (r"/", RootHandler, {"project": project, "embed": embed}),
+            (
+                rf"/projects/{re.escape(project.id)}",
+                ProjectHandler,
+                {"project": project, "embed": embed},
+            ),
+            (
+                rf"/projects/{re.escape(project.id)}/(.*)",
+                ProjectHandler,
+                {"project": project, "embed": embed},
+            ),
+            (r"/static/(.*)", StaticHandler, {"project": project}),
+        ],
+        debug=True,
     )
-    request.META["SERVER_NAME"] = handler.server.server_name
-    request.META["SERVER_PORT"] = str(handler.server.server_port)
-    return request
-
-
-def django_response_tuple(response):
-    headers = {key.lower(): value for key, value in response.headers.items()}
-    return response.status_code, bytes(response.content), headers
-
-
-def project_response(project, handler, path, body):
-    from django.http import HttpResponseRedirect
-
-    request = make_request(handler, body)
-    prefix = f"/projects/{project.id}"
-    handler_name = None
-    if path.startswith(prefix + "/"):
-        handler_name = path.removeprefix(prefix + "/")
-
-    if handler_name:
-        response = project.handle_request(handler_name, request)
-        if response:
-            return django_response_tuple(response)
-        return django_response_tuple(HttpResponseRedirect("/projects/unknown"))
-    return django_response_tuple(project.render(request))
-
-
-def make_handler(project, embed):
-    root_target = project_url(project.id, embed)
-
-    class DouweProjectHandler(BaseHTTPRequestHandler):
-        def do_HEAD(self):
-            self.handle_request(send_body=False)
-
-        def do_GET(self):
-            self.handle_request()
-
-        def do_POST(self):
-            self.handle_request()
-
-        def handle_request(self, send_body=True):
-            parsed = urlsplit(self.path)
-            path = parsed.path or "/"
-            body = self.read_body()
-
-            if path == "/":
-                self.send_response(302)
-                self.send_header("location", root_target)
-                self.end_headers()
-                return
-
-            if path.startswith("/static/"):
-                status, content, headers = static_response(path, project.id)
-            elif path == f"/projects/{project.id}" or path.startswith(
-                f"/projects/{project.id}/"
-            ):
-                status, content, headers = project_response(project, self, path, body)
-            else:
-                status, content, headers = not_found_response()
-
-            self.send_response(status)
-            for key, value in headers.items():
-                self.send_header(key, value)
-            self.send_header("content-length", str(len(content)))
-            self.end_headers()
-            if send_body:
-                self.wfile.write(content)
-
-        def read_body(self):
-            length = int(self.headers.get("content-length", "0") or 0)
-            if not length:
-                return b""
-            return self.rfile.read(length)
-
-    return DouweProjectHandler
 
 
 def open_browser_later(url):
@@ -293,14 +480,12 @@ def main(argv=None):
     if not args.no_browser:
         open_browser_later(url)
 
-    handler = make_handler(project, args.embed)
-    server = ThreadingHTTPServer((args.host, port), handler)
+    app = make_app(project, args.embed)
+    app.listen(port, address=args.host)
     try:
-        server.serve_forever()
+        tornado.ioloop.IOLoop.current().start()
     except KeyboardInterrupt:
         print()
-    finally:
-        server.server_close()
     return 0
 
 
