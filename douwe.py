@@ -1,7 +1,9 @@
 import argparse
+import os
 import importlib.util
 import mimetypes
 import re
+import subprocess
 import socket
 import sys
 import threading
@@ -18,6 +20,8 @@ import yaml
 
 
 STARTUP_DELAY_SECONDS = 0.8
+DEFAULT_GITHUB_OWNER = "DOsinga"
+CACHE_DIR = Path(os.environ.get("DOUWE_CACHE_DIR", "~/.cache/douwe")).expanduser()
 RUNNER_DIR = Path(__file__).resolve().parent
 ROOT = RUNNER_DIR.parent.parent
 PROJECTS_DIR = ROOT / "projects"
@@ -33,7 +37,7 @@ SHARED_STATIC = "./_site_static/"
 
 
 class RunnerProject:
-    def __init__(self, project_id, info, html_path):
+    def __init__(self, project_id, info, html_path, root_dir, source):
         self.id = project_id
         self.name = info.get("name", project_id)
         self.description = info.get("description", "")
@@ -45,6 +49,8 @@ class RunnerProject:
         self.nochrome = info.get("nochrome", False)
         self.dontrepeatintro = info.get("dontrepeatintro", False)
         self.html_path = html_path
+        self.root_dir = root_dir
+        self.source = source
         self.template_source = preprocess_template(strip_info_block(html_path.read_text()))
         self.impl = None
 
@@ -64,7 +70,7 @@ class RunnerProject:
 
     def thumbnail(self):
         for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"):
-            image = PROJECTS_DIR / self.id / f"{self.id}{ext}"
+            image = self.root_dir / f"{self.id}{ext}"
             if image.is_file():
                 return f"{PROJECT_STATIC}{self.id}{ext}"
         return f"{SHARED_STATIC}projects/visited/visited.jpg"
@@ -97,7 +103,13 @@ def parse_args(argv=None):
         prog="douwe",
         description="Run one douwe.com project locally.",
     )
-    parser.add_argument("project", help="Project id, e.g. cambrium")
+    parser.add_argument(
+        "project",
+        help=(
+            "Project id, local path, GitHub owner/repo, or GitHub URL "
+            "(e.g. cambrium)"
+        ),
+    )
     parser.add_argument(
         "--host",
         default="127.0.0.1",
@@ -118,6 +130,11 @@ def parse_args(argv=None):
         "--no-browser",
         action="store_true",
         help="Start the server without opening a browser.",
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Refresh a cached GitHub checkout before running it.",
     )
     return parser.parse_args(argv)
 
@@ -160,32 +177,146 @@ def preprocess_template(template_source):
     return DJANGO_STATIC_RE.sub(r"{{ site_static('\2') }}", template_source)
 
 
-def load_project(project_id):
-    if not PROJECT_ID_RE.match(project_id):
+def load_project(ref, refresh=False):
+    resolved = resolve_project_ref(ref, refresh)
+    if resolved is None:
         return None
 
-    project_dir = PROJECTS_DIR / project_id
-    html_path = project_dir / f"{project_id}.html"
-    if not html_path.is_file():
-        return None
+    project_id, html_path, root_dir, source = resolved
 
     info = parse_info_block(html_path.read_text())
     if info is None:
         return None
 
-    project = RunnerProject(project_id, info, html_path)
+    project = RunnerProject(project_id, info, html_path, root_dir, source)
     project.impl = load_project_impl(project)
     return project
 
 
+def resolve_project_ref(ref, refresh=False):
+    local = resolve_local_ref(ref)
+    if local:
+        return local
+
+    github_ref = github_repo_ref(ref)
+    if github_ref:
+        owner, repo = github_ref
+        root_dir = ensure_github_repo(owner, repo, refresh)
+        if not root_dir:
+            return None
+        html_path = find_project_html(root_dir, repo)
+        source = f"github:{owner}/{repo}"
+        if not html_path:
+            html_path = legacy_site_manifest(repo)
+            if html_path:
+                source = f"{source} with local manifest:{html_path}"
+        if not html_path:
+            print(
+                f"No project HTML info block found in {owner}/{repo}. "
+                f"Add {repo}.html to that repo.",
+                file=sys.stderr,
+            )
+            return None
+        return html_path.stem, html_path, root_dir, source
+
+    return None
+
+
+def resolve_local_ref(ref):
+    path = Path(ref).expanduser()
+    if path.exists():
+        html_path = find_project_html(path)
+        if html_path:
+            return html_path.stem, html_path, html_path.parent, f"local:{html_path.parent}"
+        return None
+
+    if PROJECT_ID_RE.match(ref):
+        project_dir = PROJECTS_DIR / ref
+        html_path = find_project_html(project_dir, ref)
+        if html_path:
+            return ref, html_path, project_dir, f"local:{project_dir}"
+    return None
+
+
+def find_project_html(path, preferred_id=None):
+    if path.is_file():
+        if path.suffix == ".html" and parse_info_block(path.read_text()) is not None:
+            return path
+        return None
+    if not path.is_dir():
+        return None
+
+    candidates = []
+    if preferred_id:
+        candidates.append(path / f"{preferred_id}.html")
+    candidates.extend([path / f"{path.name}.html", path / "project.html"])
+    candidates.extend(sorted(path.glob("*.html")))
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file() and parse_info_block(candidate.read_text()) is not None:
+            return candidate
+    return None
+
+
+def legacy_site_manifest(project_id):
+    html_path = PROJECTS_DIR / project_id / f"{project_id}.html"
+    if html_path.is_file() and parse_info_block(html_path.read_text()) is not None:
+        return html_path
+    return None
+
+
+def github_repo_ref(ref):
+    parsed = urlsplit(ref)
+    if parsed.scheme in {"http", "https"} and parsed.netloc == "github.com":
+        parts = [p for p in parsed.path.strip("/").split("/") if p]
+        if len(parts) >= 2:
+            return parts[0], parts[1].removesuffix(".git")
+        return None
+
+    if ref.startswith("github:"):
+        ref = ref.removeprefix("github:")
+
+    if "/" in ref and not ref.startswith("."):
+        parts = [p for p in ref.split("/") if p]
+        if len(parts) == 2:
+            return parts[0], parts[1].removesuffix(".git")
+
+    if PROJECT_ID_RE.match(ref):
+        return DEFAULT_GITHUB_OWNER, ref
+    return None
+
+
+def ensure_github_repo(owner, repo, refresh=False):
+    target = CACHE_DIR / "projects" / owner / repo
+    if target.exists():
+        if refresh:
+            print(f"Refreshing {owner}/{repo}...", flush=True)
+            subprocess.run(["git", "-C", str(target), "pull", "--ff-only"], check=False)
+        return target
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    url = f"https://github.com/{owner}/{repo}.git"
+    print(f"Cloning {url}...", flush=True)
+    result = subprocess.run(["git", "clone", "--depth", "1", url, str(target)])
+    if result.returncode != 0:
+        return None
+    return target
+
+
 def load_project_impl(project):
-    py_file = PROJECTS_DIR / project.id / f"{project.id}.py"
+    py_file = project.root_dir / f"{project.id}.py"
     if not py_file.is_file():
         return None
 
     root = str(ROOT)
     if root not in sys.path:
         sys.path.insert(0, root)
+    project_root = str(project.root_dir)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
 
     module_name = f"douwe_runner_loaded.{project.id}"
     spec = importlib.util.spec_from_file_location(module_name, py_file)
@@ -324,12 +455,9 @@ def not_found_response():
     return response_tuple(404, "Not found", "text/plain; charset=utf-8")
 
 
-def static_response(path, project_id):
+def static_response(path, project):
     prefixes = {
-        "/static/": [
-            PROJECTS_DIR / project_id / "static",
-            PROJECTS_DIR / project_id,
-        ],
+        "/static/": project_static_roots(project),
         "/_site_static/": [ROOT / "static"],
     }
     for prefix, roots in prefixes.items():
@@ -350,6 +478,14 @@ def static_response(path, project_id):
                 )
                 return 200, candidate.read_bytes(), {"content-type": content_type}
     return not_found_response()
+
+
+def project_static_roots(project):
+    roots = [project.root_dir / "static", project.root_dir]
+    manifest_dir = project.html_path.parent
+    if manifest_dir != project.root_dir:
+        roots.extend([manifest_dir / "static", manifest_dir])
+    return roots
 
 
 def handler_response(project, handler_name, request):
@@ -411,7 +547,7 @@ class StaticHandler(tornado.web.RequestHandler):
 
     def serve(self, path, include_body=True):
         prefix = "/_site_static/" if self.request.path.startswith("/_site_static/") else "/static/"
-        status, content, headers = static_response(f"{prefix}{path}", self.project.id)
+        status, content, headers = static_response(f"{prefix}{path}", self.project)
         self.set_status(status)
         for key, value in headers.items():
             self.set_header(key, value)
@@ -487,7 +623,7 @@ def open_browser_later(url):
 
 def main(argv=None):
     args = parse_args(argv)
-    project = load_project(args.project)
+    project = load_project(args.project, refresh=args.refresh)
     if project is None:
         print(f"Unknown project: {args.project}", file=sys.stderr)
         return 2

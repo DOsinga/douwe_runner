@@ -16,6 +16,12 @@ files:
 <pre><code>python projects/douwe_runner/douwe.py cambrium</code></pre>
 
 <p>
+  Bare names first resolve to local project directories and then to
+  <code>DOsinga/&lt;name&gt;</code> on GitHub, cached under
+  <code>~/.cache/douwe/projects/</code>.
+</p>
+
+<p>
   It loads only the requested project, renders the project template with Jinja2,
   serves project files from <code>./static/</code> through Tornado, and opens the
   result in a browser.
