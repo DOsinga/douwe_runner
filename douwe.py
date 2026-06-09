@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import jinja2
 import tornado.ioloop
 import tornado.escape
+import tornado.httputil
 import tornado.web
 import yaml
 
@@ -98,6 +99,15 @@ class RunnerRequest:
         }
         self.POST = {}
         self.FILES = {}
+        self.COOKIES = tornado.httputil.parse_cookie(
+            handler.request.headers.get("cookie", "")
+        )
+        self.META = {
+            "REMOTE_ADDR": handler.request.remote_ip or "",
+            "HTTP_X_FORWARDED_FOR": handler.request.headers.get(
+                "x-forwarded-for", ""
+            ),
+        }
         content_type = handler.request.headers.get("content-type", "")
         if self.body and content_type.startswith(
             "application/x-www-form-urlencoded"
@@ -332,6 +342,7 @@ def load_project_impl(project):
     project_root = str(project.root_dir)
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
+    install_project_namespace(project)
 
     module_name = f"douwe_runner_loaded.{project.id}"
     spec = importlib.util.spec_from_file_location(module_name, py_file)
@@ -383,6 +394,18 @@ def find_project_class(module):
         if name != "Project" and hasattr(obj, "fill_dict"):
             return obj
     return None
+
+
+def install_project_namespace(project):
+    try:
+        import projects
+    except Exception:
+        return
+    if not hasattr(projects, "__path__"):
+        return
+    parent = str(project.root_dir.parent)
+    if parent not in projects.__path__:
+        projects.__path__.append(parent)
 
 
 def project_url(project_id, embed=False):

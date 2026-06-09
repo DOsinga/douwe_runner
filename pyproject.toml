@@ -32,3 +32,4 @@ douwe = "douwe:main"
 
 [tool.setuptools]
 py-modules = ["douwe"]
+packages = ["projects"]
