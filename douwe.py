@@ -21,10 +21,19 @@ import yaml
 
 STARTUP_DELAY_SECONDS = 0.8
 DEFAULT_GITHUB_OWNER = "DOsinga"
-CACHE_DIR = Path(os.environ.get("DOUWE_CACHE_DIR", "~/.cache/douwe")).expanduser()
 RUNNER_DIR = Path(__file__).resolve().parent
-ROOT = RUNNER_DIR.parent.parent
-PROJECTS_DIR = ROOT / "projects"
+CACHE_DIR = Path(os.environ.get("DOUWE_CACHE_DIR", "~/.cache/douwe")).expanduser()
+
+
+def find_site_root():
+    for candidate in (RUNNER_DIR.parent.parent, Path.cwd()):
+        if (candidate / "projects").is_dir():
+            return candidate
+    return None
+
+
+ROOT = find_site_root()
+PROJECTS_DIR = ROOT / "projects" if ROOT else None
 PROJECT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 INFO_RE = re.compile(
     r'<script\s+type="text/markdown"\s+id="info"\s*>(.*?)</script>',
@@ -233,7 +242,7 @@ def resolve_local_ref(ref):
             return html_path.stem, html_path, html_path.parent, f"local:{html_path.parent}"
         return None
 
-    if PROJECT_ID_RE.match(ref):
+    if PROJECTS_DIR and PROJECT_ID_RE.match(ref):
         project_dir = PROJECTS_DIR / ref
         html_path = find_project_html(project_dir, ref)
         if html_path:
@@ -265,6 +274,8 @@ def find_project_html(path, preferred_id=None):
 
 
 def legacy_site_manifest(project_id):
+    if not PROJECTS_DIR:
+        return None
     html_path = PROJECTS_DIR / project_id / f"{project_id}.html"
     if html_path.is_file() and parse_info_block(html_path.read_text()) is not None:
         return html_path
@@ -314,9 +325,10 @@ def load_project_impl(project):
     if not py_file.is_file():
         return None
 
-    root = str(ROOT)
-    if root not in sys.path:
-        sys.path.insert(0, root)
+    if ROOT:
+        root = str(ROOT)
+        if root not in sys.path:
+            sys.path.insert(0, root)
     project_root = str(project.root_dir)
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
@@ -461,7 +473,7 @@ def not_found_response():
 def static_response(path, project):
     prefixes = {
         "/static/": project_static_roots(project),
-        "/_site_static/": [ROOT / "static"],
+        "/_site_static/": site_static_roots(),
     }
     for prefix, roots in prefixes.items():
         if not path.startswith(prefix):
@@ -489,6 +501,12 @@ def project_static_roots(project):
     if manifest_dir != project.root_dir:
         roots.extend([manifest_dir / "static", manifest_dir])
     return roots
+
+
+def site_static_roots():
+    if not ROOT:
+        return []
+    return [ROOT / "static"]
 
 
 def handler_response(project, handler_name, request):

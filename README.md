@@ -1,6 +1,21 @@
 # Douwe Runner
 
-Run one douwe.com project locally from the repository root:
+Run one douwe.com project locally:
+
+```bash
+uvx douwe cambrium
+```
+
+or:
+
+```bash
+pipx run douwe cambrium
+```
+
+A bare name like `cambrium` resolves to `github.com/DOsinga/cambrium` and caches
+the clone under `~/.cache/douwe/projects/`.
+
+From the main douwe.com checkout, you can also run the development copy directly:
 
 ```bash
 python projects/douwe_runner/douwe.py cambrium
@@ -15,9 +30,9 @@ python projects/douwe_runner/douwe.py DOsinga/cambrium
 python projects/douwe_runner/douwe.py https://github.com/DOsinga/cambrium
 ```
 
-Inside this checkout, a bare name like `cambrium` prefers `./projects/cambrium`.
-If no local project exists, it resolves to `github.com/DOsinga/<name>` and caches
-the clone under `~/.cache/douwe/projects/`.
+Inside the douwe.com checkout, a bare name like `cambrium` prefers
+`./projects/cambrium`. Outside that checkout, it resolves to
+`github.com/DOsinga/<name>`.
 
 Useful options:
 
@@ -26,6 +41,13 @@ python projects/douwe_runner/douwe.py cambrium --embed
 python projects/douwe_runner/douwe.py cambrium --no-browser
 python projects/douwe_runner/douwe.py cambrium --port 9000
 python projects/douwe_runner/douwe.py cambrium --refresh
+```
+
+Installed-package equivalents work the same way:
+
+```bash
+douwe cambrium --port 9000
+douwe cambrium --refresh
 ```
 
 The runner intentionally loads only the requested project. That keeps old or
@@ -43,3 +65,23 @@ Independent repos should eventually include their own `<project>.html` file with
 the existing info block. During migration, if a GitHub repo has no HTML info
 block but this checkout has `projects/<project>/<project>.html`, the runner uses
 that local manifest and serves assets from the cloned repo first.
+
+## Publishing
+
+Build the package:
+
+```bash
+python -m build
+```
+
+Publish to PyPI:
+
+```bash
+python -m twine upload dist/*
+```
+
+After that, the globally runnable path is:
+
+```bash
+uvx douwe cambrium
+```
