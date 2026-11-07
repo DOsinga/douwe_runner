@@ -516,7 +516,7 @@ def load_project_impl(project):
         sys.path.insert(0, project_root)
     install_project_namespace(project)
 
-    module_name = f"douwe_runner_loaded.{project.id}"
+    module_name = f"projects.{project.id}.{project.id}"
     spec = importlib.util.spec_from_file_location(module_name, py_file)
     if not spec or not spec.loader:
         return None

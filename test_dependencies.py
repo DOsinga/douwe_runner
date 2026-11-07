@@ -8,6 +8,29 @@ import douwe
 
 
 class ProjectDependenciesTest(unittest.TestCase):
+    def test_project_relative_imports(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "relative_imports"
+            root.mkdir()
+            (root / "relative_imports.html").write_text(
+                '<script type="text/markdown" id="info">\n'
+                "name: Relative imports\n"
+                "description: Test project\n"
+                "</script>\n"
+            )
+            (root / "helper.py").write_text("VALUE = 'loaded'\n")
+            (root / "relative_imports.py").write_text(
+                "from .helper import VALUE\n"
+                "from projects.common import Project\n"
+                "class RelativeImports(Project):\n"
+                "    value = VALUE\n"
+            )
+
+            with patch.object(douwe, "ROOT", None):
+                project = douwe.load_project(str(root))
+
+            self.assertEqual(project.impl.value, "loaded")
+
     def test_runner_requirements_take_precedence(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
