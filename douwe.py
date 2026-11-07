@@ -13,10 +13,11 @@ import time
 import webbrowser
 from pathlib import Path
 from urllib.error import URLError
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from urllib.request import urlopen
 
 import jinja2
+from markupsafe import Markup, escape
 import tornado.ioloop
 import tornado.escape
 import tornado.httputil
@@ -54,6 +55,9 @@ INFO_RE = re.compile(
 LOAD_STATIC_RE = re.compile(r"{%\s*load\s+static\s*%}\s*")
 CSRF_TOKEN_RE = re.compile(r"{%\s*csrf_token\s*%}\s*")
 DJANGO_STATIC_RE = re.compile(r"{%\s*static\s+(['\"])(.*?)\1\s*%}")
+DJANGO_FILTER_ARG_RE = re.compile(
+    r"\|([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*('[^']*'|\"[^\"]*\")"
+)
 PROJECT_STATIC = "./static/"
 SHARED_STATIC = "./_site_static/"
 FAVICON_PATH = RUNNER_DIR / "projects" / "favicon.ico"
@@ -74,7 +78,9 @@ class RunnerProject:
         self.html_path = html_path
         self.root_dir = root_dir
         self.source = source
-        self.template_source = preprocess_template(strip_info_block(html_path.read_text()))
+        self.template_source = preprocess_template(
+            strip_info_block(html_path.read_text()), project_id, root_dir.name
+        )
         self.impl = None
 
     def fill_dict(self, request, context):
@@ -101,6 +107,7 @@ class RunnerProject:
 
 class RunnerRequest:
     def __init__(self, handler):
+        self._handler = handler
         parsed = urlsplit(handler.request.uri)
         self.method = handler.request.method
         self.path = parsed.path
@@ -129,6 +136,10 @@ class RunnerRequest:
                 for key, values in parse_qs(self.body.decode("utf-8")).items()
             }
         self.headers = handler.request.headers
+
+    def build_absolute_uri(self, location=None):
+        base = f"{self._handler.request.protocol}://{self._handler.request.host}"
+        return urljoin(f"{base}{self.path}", location or self._handler.request.uri)
 
 
 def parse_args(argv=None):
@@ -214,10 +225,24 @@ def strip_info_block(html):
     return INFO_RE.sub("", html, count=1).strip()
 
 
-def preprocess_template(template_source):
+def preprocess_template(template_source, project_id=None, repo_name=None):
     template_source = LOAD_STATIC_RE.sub("", template_source)
     template_source = CSRF_TOKEN_RE.sub("", template_source)
-    return DJANGO_STATIC_RE.sub(r"{{ site_static('\2') }}", template_source)
+    template_source = DJANGO_FILTER_ARG_RE.sub(r"|\1(\2)", template_source)
+    project_prefixes = {
+        f"projects/{name}/"
+        for name in (project_id, repo_name)
+        if name
+    }
+
+    def replace_static(match):
+        path = match.group(2)
+        for prefix in project_prefixes:
+            if path.startswith(prefix):
+                return f"{{{{ project_static({path.removeprefix(prefix)!r}) }}}}"
+        return f"{{{{ site_static({path!r}) }}}}"
+
+    return DJANGO_STATIC_RE.sub(replace_static, template_source)
 
 
 def load_project(ref, refresh=False, runner_argv=None):
@@ -302,7 +327,7 @@ def resolve_project_ref(ref, refresh=False):
     public_ref = public_project_ref(ref)
     if public_ref:
         owner, repo = public_ref
-        return resolve_github_project(owner, repo, refresh)
+        return resolve_github_project(owner, repo, refresh, preferred_id=ref)
 
     github_ref = github_repo_ref(ref)
     if github_ref:
@@ -312,11 +337,11 @@ def resolve_project_ref(ref, refresh=False):
     return None
 
 
-def resolve_github_project(owner, repo, refresh=False):
+def resolve_github_project(owner, repo, refresh=False, preferred_id=None):
     root_dir = ensure_github_repo(owner, repo, refresh)
     if not root_dir:
         return None
-    html_path = find_project_html(root_dir, repo)
+    html_path = find_project_html(root_dir, preferred_id or repo)
     source = f"github:{owner}/{repo}"
     if not html_path:
         html_path = legacy_site_manifest(repo)
@@ -585,10 +610,46 @@ def project_url(project_id, embed=False):
     return f"{path}?{urlencode({'embed': '1'})}"
 
 
+def yesno_filter(value, choices="yes,no,maybe"):
+    labels = choices.split(",")
+    if value is None and len(labels) > 2:
+        return labels[2]
+    return labels[0] if value else labels[1] if len(labels) > 1 else ""
+
+
+def date_filter(value, format_string):
+    if format_string == "c":
+        return value.isoformat()
+    replacements = {"D": "%a", "H": "%H", "i": "%M"}
+    return value.strftime("".join(replacements.get(char, char) for char in format_string))
+
+
+def escapejs_filter(value):
+    escaped = json.dumps(str(value), ensure_ascii=True)[1:-1]
+    return (
+        escaped.replace("<", r"\u003C")
+        .replace(">", r"\u003E")
+        .replace("&", r"\u0026")
+    )
+
+
+def json_script_filter(value, element_id):
+    payload = json.dumps(value, ensure_ascii=False).translate(
+        {ord("<"): r"\u003C", ord(">"): r"\u003E", ord("&"): r"\u0026"}
+    )
+    return Markup(
+        f'<script id="{escape(element_id)}" type="application/json">{payload}</script>'
+    )
+
+
 def jinja_env(project):
     env = jinja2.Environment(autoescape=False)
     env.globals["site_static"] = lambda path: f"{SHARED_STATIC}{path}"
     env.globals["project_static"] = lambda path: f"{PROJECT_STATIC}{path}"
+    env.filters["date"] = date_filter
+    env.filters["escapejs"] = escapejs_filter
+    env.filters["json_script"] = json_script_filter
+    env.filters["yesno"] = yesno_filter
     return env
 
 
@@ -665,6 +726,12 @@ def not_found_response():
 
 
 def static_response(path, project):
+    for name in {project.id, project.root_dir.name}:
+        prefix = f"/static/projects/{name}/"
+        if path.startswith(prefix):
+            path = f"/static/{path.removeprefix(prefix)}"
+            break
+
     prefixes = {
         "/static/": project_static_roots(project),
         "/_site_static/": site_static_roots(),

@@ -1,8 +1,10 @@
 import json
+import sys
 from pathlib import Path
 
 
 WEBSITE_ROOT = "."
+IS_MACOS = sys.platform == "darwin"
 
 
 class RedirectException(BaseException):

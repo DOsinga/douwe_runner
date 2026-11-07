@@ -72,8 +72,12 @@ projects that do not publish a standalone repo yet.
 
 Project templates are rendered with Jinja2 and served with Tornado. Existing
 douwe.com project templates can keep using `{{ static }}` and `{% static "..."
-%}` asset references, which the runner maps to local project and shared static
-directories.
+%}` asset references, common Django filters, and legacy
+`/static/projects/<id>/` URLs. The runner maps them to the standalone project.
+
+One repository can contain more than one project page. Bare names preserve the
+requested project ID, so `uvx douwe gapmover` selects `gapmover.html` from the
+World Sizer repository.
 
 GitHub-backed projects use the `git` command-line tool for cloning and
 refreshing. The GitHub CLI (`gh`) is not required, and the runner does not call
