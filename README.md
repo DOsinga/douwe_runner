@@ -57,6 +57,15 @@ Douwe Runner is a small local server for standalone douwe.com projects. It
 accepts a project directory, a `DOsinga/<repo>` reference, or a GitHub URL; when
 needed it caches a shallow clone under `~/.cache/douwe/projects/`.
 
+If a project includes `requirements-runner.txt`, Douwe Runner uses `uv` to
+start the project with those dependencies in an isolated environment. If that
+file is absent, it uses `requirements.txt`. This happens automatically when
+the runner is launched with `uvx`.
+
+Use `requirements-runner.txt` when the web project needs fewer packages than
+its data generation, training, or development tools. An empty file explicitly
+marks the web project as having no extra dependencies.
+
 Use `douwe --list` or `douwe list` to see standalone GitHub-backed projects from
 douwe.com. The list comes from `https://douwe.com/projects/index.json` and skips
 projects that do not publish a standalone repo yet.

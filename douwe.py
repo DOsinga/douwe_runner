@@ -33,6 +33,8 @@ PROJECT_INDEX_JSON_URL = os.environ.get(
 )
 PROJECT_INDEX_TIMEOUT = 8
 LAST_RESOLVE_ERROR = None
+DEPENDENCIES_READY_ENV = "DOUWE_DEPENDENCIES_READY"
+RUNNER_REQUIREMENTS = "requirements-runner.txt"
 
 
 def find_site_root():
@@ -218,7 +220,7 @@ def preprocess_template(template_source):
     return DJANGO_STATIC_RE.sub(r"{{ site_static('\2') }}", template_source)
 
 
-def load_project(ref, refresh=False):
+def load_project(ref, refresh=False, runner_argv=None):
     global LAST_RESOLVE_ERROR
     LAST_RESOLVE_ERROR = None
     resolved = resolve_project_ref(ref, refresh)
@@ -226,6 +228,8 @@ def load_project(ref, refresh=False):
         return None
 
     project_id, html_path, root_dir, source = resolved
+    if runner_argv is not None:
+        reexec_with_project_dependencies(root_dir, runner_argv)
 
     info = parse_info_block(html_path.read_text())
     if info is None:
@@ -234,6 +238,59 @@ def load_project(ref, refresh=False):
     project = RunnerProject(project_id, info, html_path, root_dir, source)
     project.impl = load_project_impl(project)
     return project
+
+
+def project_requirements(root_dir):
+    runner_requirements = root_dir / RUNNER_REQUIREMENTS
+    if runner_requirements.is_file():
+        return runner_requirements if has_requirements(runner_requirements) else None
+
+    requirements = root_dir / "requirements.txt"
+    return requirements if requirements.is_file() and has_requirements(requirements) else None
+
+
+def has_requirements(path):
+    return any(
+        line.strip() and not line.lstrip().startswith("#")
+        for line in path.read_text().splitlines()
+    )
+
+
+def reexec_with_project_dependencies(root_dir, runner_argv):
+    if os.environ.get(DEPENDENCIES_READY_ENV):
+        return
+
+    requirements = project_requirements(root_dir)
+    if requirements is None:
+        return
+
+    uv = shutil.which("uv")
+    if not uv:
+        print(
+            f"Install the dependencies in {requirements} or run this project with uvx.",
+            file=sys.stderr,
+        )
+        return
+
+    command = [
+        uv,
+        "run",
+        "--with-requirements",
+        str(requirements),
+        "--with",
+        "Jinja2>=3.1",
+        "--with",
+        "PyYAML>=6.0",
+        "--with",
+        "tornado>=6.4",
+        "python",
+        str(Path(__file__).resolve()),
+        *runner_argv,
+    ]
+    env = os.environ.copy()
+    env[DEPENDENCIES_READY_ENV] = "1"
+    print(f"Loading project dependencies from {requirements.name}...", flush=True)
+    os.execvpe(uv, command, env)
 
 
 def resolve_project_ref(ref, refresh=False):
@@ -800,11 +857,16 @@ def open_browser_later(url):
 
 
 def main(argv=None):
-    args = parse_args(argv)
+    runner_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parse_args(runner_argv)
     if args.list or args.project == "list":
         return list_projects()
 
-    project = load_project(args.project, refresh=args.refresh)
+    project = load_project(
+        args.project,
+        refresh=args.refresh,
+        runner_argv=runner_argv,
+    )
     if project is None:
         if not LAST_RESOLVE_ERROR:
             print(f"Unknown project: {args.project}", file=sys.stderr)
