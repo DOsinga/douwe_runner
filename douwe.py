@@ -507,10 +507,6 @@ def load_project_impl(project):
     if not py_file.is_file():
         return None
 
-    if ROOT:
-        root = str(ROOT)
-        if root not in sys.path:
-            sys.path.insert(0, root)
     project_root = str(project.root_dir)
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
