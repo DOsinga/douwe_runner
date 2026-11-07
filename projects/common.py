@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 
 WEBSITE_ROOT = "."
@@ -55,6 +56,9 @@ class Project:
 
     def receive(self, payload):
         pass
+
+    def file_path(self, name):
+        return str(Path(self._project_root) / "static" / name)
 
 
 class HttpResponse:

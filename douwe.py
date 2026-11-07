@@ -275,6 +275,7 @@ def reexec_with_project_dependencies(root_dir, runner_argv):
     command = [
         uv,
         "run",
+        "--no-project",
         "--with-requirements",
         str(requirements),
         "--with",
@@ -533,7 +534,7 @@ def load_project_impl(project):
         return None
 
     try:
-        return impl_class(
+        impl = impl_class(
             project.id,
             project.name,
             project.description,
@@ -545,6 +546,8 @@ def load_project_impl(project):
             nochrome=project.nochrome,
             dontrepeatintro=project.dontrepeatintro,
         )
+        impl._project_root = project.root_dir
+        return impl
     except Exception as exc:
         print(f"Warning: could not initialize {py_file}: {exc}", file=sys.stderr)
         return None

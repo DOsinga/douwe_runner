@@ -42,9 +42,10 @@ class ProjectDependenciesTest(unittest.TestCase):
 
             command = execvpe.call_args.args[1]
             env = execvpe.call_args.args[2]
-            self.assertEqual(command[:4], [
+            self.assertEqual(command[:5], [
                 "/usr/bin/uv",
                 "run",
+                "--no-project",
                 "--with-requirements",
                 str(requirements),
             ])
