@@ -37,6 +37,8 @@ Inside the douwe.com checkout, a bare name like `cambrium` prefers
 Useful options:
 
 ```bash
+python projects/douwe_runner/douwe.py --list
+python projects/douwe_runner/douwe.py list
 python projects/douwe_runner/douwe.py cambrium --embed
 python projects/douwe_runner/douwe.py cambrium --no-browser
 python projects/douwe_runner/douwe.py cambrium --port 9000
@@ -46,42 +48,27 @@ python projects/douwe_runner/douwe.py cambrium --refresh
 Installed-package equivalents work the same way:
 
 ```bash
+douwe --list
 douwe cambrium --port 9000
 douwe cambrium --refresh
 ```
 
-The runner intentionally loads only the requested project. That keeps old or
-dependency-heavy projects from breaking otherwise simple projects.
+Douwe Runner is a small local server for standalone douwe.com projects. It
+accepts a project directory, a `DOsinga/<repo>` reference, or a GitHub URL; when
+needed it caches a shallow clone under `~/.cache/douwe/projects/`.
 
-This version uses Tornado for serving and Jinja2 for project template rendering.
-It does not call Django's renderer or configure Django settings. `{% load static
-%}` is stripped from project templates, `{{ static }}` points at `./static/`,
-and `{% static "..." %}` is rewritten to a shared `./_site_static/...` URL.
+Use `douwe --list` or `douwe list` to see standalone GitHub-backed projects from
+douwe.com. The list comes from `https://douwe.com/projects/index.json` and skips
+projects that do not publish a standalone repo yet.
+
+Project templates are rendered with Jinja2 and served with Tornado. Existing
+douwe.com project templates can keep using `{{ static }}` and `{% static "..."
+%}` asset references, which the runner maps to local project and shared static
+directories.
+
+GitHub-backed projects use the `git` command-line tool for cloning and
+refreshing. The GitHub CLI (`gh`) is not required, and the runner does not call
+the GitHub API. Local project paths do not require git.
 
 Projects that require WebSockets still need the full Django/Channels site for
-now, but Tornado gives the runner a natural place to add that later.
-
-Independent repos should eventually include their own `<project>.html` file with
-the existing info block. During migration, if a GitHub repo has no HTML info
-block but this checkout has `projects/<project>/<project>.html`, the runner uses
-that local manifest and serves assets from the cloned repo first.
-
-## Publishing
-
-Build the package:
-
-```bash
-python -m build
-```
-
-Publish to PyPI:
-
-```bash
-python -m twine upload dist/*
-```
-
-After that, the globally runnable path is:
-
-```bash
-uvx douwe cambrium
-```
+now.

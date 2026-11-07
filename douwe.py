@@ -1,8 +1,10 @@
 import argparse
+import json
 import os
 import importlib.util
 import mimetypes
 import re
+import shutil
 import subprocess
 import socket
 import sys
@@ -10,7 +12,9 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
+from urllib.error import URLError
 from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.request import urlopen
 
 import jinja2
 import tornado.ioloop
@@ -24,11 +28,16 @@ STARTUP_DELAY_SECONDS = 0.8
 DEFAULT_GITHUB_OWNER = "DOsinga"
 RUNNER_DIR = Path(__file__).resolve().parent
 CACHE_DIR = Path(os.environ.get("DOUWE_CACHE_DIR", "~/.cache/douwe")).expanduser()
+PROJECT_INDEX_JSON_URL = os.environ.get(
+    "DOUWE_PROJECT_INDEX_JSON_URL", "https://douwe.com/projects/index.json"
+)
+PROJECT_INDEX_TIMEOUT = 8
+LAST_RESOLVE_ERROR = None
 
 
 def find_site_root():
     for candidate in (RUNNER_DIR.parent.parent, Path.cwd()):
-        if (candidate / "projects").is_dir():
+        if (candidate / "projects" / "order.txt").is_file():
             return candidate
     return None
 
@@ -45,6 +54,7 @@ CSRF_TOKEN_RE = re.compile(r"{%\s*csrf_token\s*%}\s*")
 DJANGO_STATIC_RE = re.compile(r"{%\s*static\s+(['\"])(.*?)\1\s*%}")
 PROJECT_STATIC = "./static/"
 SHARED_STATIC = "./_site_static/"
+FAVICON_PATH = RUNNER_DIR / "projects" / "favicon.ico"
 
 
 class RunnerProject:
@@ -126,10 +136,16 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "project",
+        nargs="?",
         help=(
             "Project id, local path, GitHub owner/repo, or GitHub URL "
-            "(e.g. cambrium)"
+            "(e.g. cambrium), or 'list' to show available projects"
         ),
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List projects from douwe.com.",
     )
     parser.add_argument(
         "--host",
@@ -157,7 +173,10 @@ def parse_args(argv=None):
         action="store_true",
         help="Refresh a cached GitHub checkout before running it.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.project and not args.list:
+        parser.error("project is required unless --list is used")
+    return args
 
 
 def find_open_port(host, preferred_port):
@@ -200,6 +219,8 @@ def preprocess_template(template_source):
 
 
 def load_project(ref, refresh=False):
+    global LAST_RESOLVE_ERROR
+    LAST_RESOLVE_ERROR = None
     resolved = resolve_project_ref(ref, refresh)
     if resolved is None:
         return None
@@ -220,28 +241,37 @@ def resolve_project_ref(ref, refresh=False):
     if local:
         return local
 
+    public_ref = public_project_ref(ref)
+    if public_ref:
+        owner, repo = public_ref
+        return resolve_github_project(owner, repo, refresh)
+
     github_ref = github_repo_ref(ref)
     if github_ref:
         owner, repo = github_ref
-        root_dir = ensure_github_repo(owner, repo, refresh)
-        if not root_dir:
-            return None
-        html_path = find_project_html(root_dir, repo)
-        source = f"github:{owner}/{repo}"
-        if not html_path:
-            html_path = legacy_site_manifest(repo)
-            if html_path:
-                source = f"{source} with local manifest:{html_path}"
-        if not html_path:
-            print(
-                f"No project HTML info block found in {owner}/{repo}. "
-                f"Add {repo}.html to that repo.",
-                file=sys.stderr,
-            )
-            return None
-        return html_path.stem, html_path, root_dir, source
+        return resolve_github_project(owner, repo, refresh)
 
     return None
+
+
+def resolve_github_project(owner, repo, refresh=False):
+    root_dir = ensure_github_repo(owner, repo, refresh)
+    if not root_dir:
+        return None
+    html_path = find_project_html(root_dir, repo)
+    source = f"github:{owner}/{repo}"
+    if not html_path:
+        html_path = legacy_site_manifest(repo)
+        if html_path:
+            source = f"{source} with local manifest:{html_path}"
+    if not html_path:
+        print(
+            f"No project HTML info block found in {owner}/{repo}. "
+            f"Add {repo}.html to that repo.",
+            file=sys.stderr,
+        )
+        return None
+    return html_path.stem, html_path, root_dir, source
 
 
 def resolve_local_ref(ref):
@@ -283,6 +313,92 @@ def find_project_html(path, preferred_id=None):
     return None
 
 
+def print_project_table(rows, source=None):
+    if not rows:
+        print("No projects found.")
+        return
+
+    if source:
+        print(source)
+        print()
+
+    id_width = min(max(len(row[0]) for row in rows), 32)
+    name_width = min(max(len(row[1]) for row in rows), 28)
+    terminal_width = shutil.get_terminal_size((100, 20)).columns
+    summary_width = max(24, terminal_width - id_width - name_width - 6)
+
+    print(f"{'project':<{id_width}}  {'name':<{name_width}}  description")
+    print(f"{'-' * id_width}  {'-' * name_width}  {'-' * min(summary_width, 40)}")
+    for project_id, name, summary in rows:
+        if len(summary) > summary_width:
+            summary = summary[: summary_width - 3].rstrip() + "..."
+        print(f"{project_id:<{id_width}}  {name:<{name_width}}  {summary}")
+
+
+def fetch_public_project_rows():
+    projects = fetch_public_projects()
+    rows = []
+    for project in projects:
+        project_id = project.get("id")
+        if not project_id or not project.get("github"):
+            continue
+        rows.append(
+            (
+                project_id,
+                project.get("name") or project_id,
+                " ".join(str(project.get("description") or "").split()),
+            )
+        )
+    return rows, PROJECT_INDEX_JSON_URL
+
+
+def fetch_public_projects():
+    with urlopen(PROJECT_INDEX_JSON_URL, timeout=PROJECT_INDEX_TIMEOUT) as response:
+        payload = json.loads(response.read().decode("utf-8", "replace"))
+    return payload.get("projects", [])
+
+
+def public_project_ref(ref):
+    if not PROJECT_ID_RE.match(ref):
+        return None
+    try:
+        projects = fetch_public_projects()
+    except (OSError, URLError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Could not fetch {PROJECT_INDEX_JSON_URL}: {exc}", file=sys.stderr)
+        return None
+
+    for project in projects:
+        project_id = project.get("id")
+        if project_id != ref:
+            continue
+        github = project.get("github")
+        if github:
+            return github_repo_ref(github)
+        global LAST_RESOLVE_ERROR
+        LAST_RESOLVE_ERROR = (
+            f"{ref} is listed on douwe.com, but it does not publish a "
+            "standalone GitHub repo yet. Try it from the full douwe.com "
+            "checkout for now."
+        )
+        print(
+            LAST_RESOLVE_ERROR,
+            file=sys.stderr,
+        )
+        return None
+    return None
+
+
+def list_projects():
+    try:
+        rows, source_url = fetch_public_project_rows()
+    except (OSError, URLError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Could not fetch {PROJECT_INDEX_JSON_URL}: {exc}", file=sys.stderr)
+        return 2
+
+    print_project_table(rows, f"Projects from {source_url}:")
+    return 0
+
+
 def legacy_site_manifest(project_id):
     if not PROJECTS_DIR:
         return None
@@ -308,8 +424,6 @@ def github_repo_ref(ref):
         if len(parts) == 2:
             return parts[0], parts[1].removesuffix(".git")
 
-    if PROJECT_ID_RE.match(ref):
-        return DEFAULT_GITHUB_OWNER, ref
     return None
 
 
@@ -465,6 +579,7 @@ def render_project_page(project, request, embed=False):
   <meta name="description" content="{tornado.escape.xhtml_escape(project.shortdescription)}">
   <meta property="og:title" content="{tornado.escape.xhtml_escape(project.name)}">
   <meta property="og:image" content="{tornado.escape.xhtml_escape(project.thumbnail())}">
+  <link rel="icon" href="/favicon.ico" sizes="any">
   <style>
     body {{ font-family: Georgia, serif; margin: 2rem auto; max-width: 900px; line-height: 1.5; padding: 0 1rem; }}
     h1 {{ font-family: system-ui, sans-serif; }}
@@ -579,6 +694,24 @@ class ProjectRedirectHandler(tornado.web.RequestHandler):
             self.redirect(f"{project_url(self.project.id, self.embed)}{suffix}")
 
 
+class FaviconHandler(tornado.web.RequestHandler):
+    def get(self):
+        if not FAVICON_PATH.is_file():
+            raise tornado.web.HTTPError(404)
+        content = FAVICON_PATH.read_bytes()
+        self.set_header("content-type", "image/x-icon")
+        self.set_header("cache-control", "public, max-age=86400")
+        self.set_header("content-length", str(len(content)))
+        self.write(content)
+
+    def head(self):
+        if not FAVICON_PATH.is_file():
+            raise tornado.web.HTTPError(404)
+        self.set_header("content-type", "image/x-icon")
+        self.set_header("cache-control", "public, max-age=86400")
+        self.set_header("content-length", str(FAVICON_PATH.stat().st_size))
+
+
 class StaticHandler(tornado.web.RequestHandler):
     def initialize(self, project):
         self.project = project
@@ -638,6 +771,7 @@ def make_app(project, embed):
     return tornado.web.Application(
         [
             (r"/", RootHandler, {"project": project, "embed": embed}),
+            (r"/favicon.ico", FaviconHandler),
             (
                 rf"/projects/{re.escape(project.id)}",
                 ProjectRedirectHandler,
@@ -667,9 +801,13 @@ def open_browser_later(url):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.list or args.project == "list":
+        return list_projects()
+
     project = load_project(args.project, refresh=args.refresh)
     if project is None:
-        print(f"Unknown project: {args.project}", file=sys.stderr)
+        if not LAST_RESOLVE_ERROR:
+            print(f"Unknown project: {args.project}", file=sys.stderr)
         return 2
 
     port = find_open_port(args.host, args.port)

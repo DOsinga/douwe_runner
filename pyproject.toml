@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "douwe"
-version = "0.1.0"
+version = "0.1.5"
 description = "Run douwe.com projects locally from their standalone repositories."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -33,3 +33,6 @@ douwe = "douwe:main"
 [tool.setuptools]
 py-modules = ["douwe"]
 packages = ["projects"]
+
+[tool.setuptools.package-data]
+projects = ["favicon.ico"]
